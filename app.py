@@ -38,6 +38,10 @@ if 'questions_answers' not in st.session_state:
 # Add a queue for transcribed text results
 if 'transcript_q' not in st.session_state:
     st.session_state.transcript_q = queue.Queue()
+if 'needs_update' not in st.session_state:
+    st.session_state.needs_update = False
+if 'last_correction' not in st.session_state:
+    st.session_state.last_correction = None
 
 # LLM provider configuration
 @st.cache_resource
@@ -96,48 +100,64 @@ def record_audio(stop_event, audio_q):
     except Exception as e:
         print(f"Error during audio recording: {str(e)}")
 
-def process_audio(stop_event, audio_q, transcript_q, whisper_model_instance, update_interval=1.0):
-    """Process audio from queue, transcribe, and put text into transcript_q."""
+def process_audio(stop_event, audio_q, transcript_q, whisper_model_instance):
+    """Process audio with overlapping windows to enable correction of previous text."""
     buffer = []
-    last_process_time = time.time()
-
-    # Use the passed whisper_model_instance
+    previous_segments = np.array([])  # Initialize as empty NumPy array
+    overlap_seconds = 2  # Amount of audio to overlap with previous processing
+    sample_rate = 16000  # Whisper's expected sample rate
+    overlap_samples = int(overlap_seconds * sample_rate)
+    
     if not whisper_model_instance:
         print("Whisper model not loaded, processing thread exiting.")
-        return # Exit if no model
-
+        return
+    
     while not stop_event.is_set() or not audio_q.empty():
-        # Check if it's time to process audio
-        current_time = time.time()
-        if current_time - last_process_time < update_interval and not stop_event.is_set():
-            # Collect audio data
-            try:
-                audio_chunk = audio_q.get(timeout=0.1)
-                buffer.append(audio_chunk)
-            except queue.Empty:
-                time.sleep(0.1)  # Short sleep if queue is empty
-            continue
-
-        # If we have audio to process
-        if buffer:
-            try:
-                # Combine audio chunks and process with Whisper
-                audio_data = np.concatenate(buffer)
-                # Use the passed model instance
-                result = whisper_model_instance.transcribe(audio_data, fp16=torch.cuda.is_available())
+        # Get audio chunk with a short timeout
+        try:
+            audio_chunk = audio_q.get(timeout=0.1)
+            buffer.append(audio_chunk)
+            
+            # Process when buffer gets large enough (about 2-3 seconds of audio)
+            if len(buffer) >= 30:  # Adjust based on your chunk size
+                # Create processing segment with overlap from previous audio
+                current_audio = np.concatenate(buffer)
+                
+                # Include overlap from previous segments if available
+                if len(previous_segments) > 0:  # Fix: Use len() instead of direct boolean eval
+                    # Combine last portion of previous segments with current audio
+                    overlap_audio = previous_segments[-overlap_samples:] if len(previous_segments) > overlap_samples else previous_segments
+                    process_audio = np.concatenate([overlap_audio, current_audio])
+                else:
+                    process_audio = current_audio
+                
+                # Update previous segments for next processing
+                previous_segments = np.concatenate([previous_segments, current_audio]) if len(previous_segments) > 0 else current_audio
+                # Trim previous_segments to prevent excessive memory usage
+                max_history = sample_rate * 10  # 10 seconds of history
+                if len(previous_segments) > max_history:
+                    previous_segments = previous_segments[-max_history:]
+                
+                # Transcribe with context
+                result = whisper_model_instance.transcribe(process_audio, fp16=torch.cuda.is_available())
                 transcribed_text = result["text"].strip()
+                
                 if transcribed_text:
-                    # Put the result into the transcript queue instead of session state
-                    transcript_q.put(transcribed_text)
+                    # Send both the text and position information
+                    transcript_q.put({
+                        "text": transcribed_text,
+                        "is_correction": len(previous_segments) > overlap_samples,
+                        "overlap_seconds": overlap_seconds
+                    })
+                
+                # Clear current buffer but keep overlap for next processing
                 buffer = []
-            except Exception as e:
-                # Log error, avoid using st.error in thread
-                print(f"Error processing audio: {str(e)}")
-
-        last_process_time = current_time
-
-        # Removed summary generation logic from thread
-        # Let main thread handle summary timing and generation
+                
+        except queue.Empty:
+            if not stop_event.is_set():
+                time.sleep(0.1)
+            else:
+                break
 
 def generate_summary():
     """Generate a summary of the current transcript using the selected LLM."""
@@ -315,6 +335,55 @@ def stop_recording():
     if 'proc_thread' in st.session_state: del st.session_state['proc_thread']
     if 'stop_event' in st.session_state: del st.session_state['stop_event']
 
+def find_common_suffix(text1, text2, max_words=10):
+    """Find common text between the end of text1 and anywhere in text2."""
+    # Handle empty strings
+    if not text1 or not text2:
+        return None
+        
+    words1 = text1.split()[-max_words:] if len(text1.split()) > max_words else text1.split()
+    
+    # Try successively smaller suffixes of text1
+    for i in range(len(words1)):
+        suffix = " ".join(words1[i:])
+        if len(suffix) > 10 and suffix in text2:  # Ensure suffix is substantial
+            return suffix
+            
+    # If no long match found, try matching last few words exactly
+    if len(words1) >= 3:
+        short_suffix = " ".join(words1[-3:])
+        if short_suffix in text2:
+            return short_suffix
+            
+    return None
+
+# Add to the top of your app.py file
+st.markdown("""
+<style>
+.correction {
+    background-color: rgba(255, 255, 0, 0.2);
+    animation: highlight 2s ease-out;
+}
+@keyframes highlight {
+    from {background-color: rgba(255, 255, 0, 0.4);}
+    to {background-color: rgba(255, 255, 0, 0);}
+}
+</style>
+""", unsafe_allow_html=True)
+
+# Then modify transcript display to use HTML when needed
+def format_transcript_with_highlight(transcript, last_updated_portion=None):
+    """Format transcript with visual highlighting for recently corrected text."""
+    if last_updated_portion and last_updated_portion in transcript:
+        # Highlight the corrected portion
+        highlighted = transcript.replace(
+            last_updated_portion, 
+            f'<span class="correction">{last_updated_portion}</span>', 
+            1
+        )
+        return highlighted
+    return transcript
+
 # UI Layout
 st.title("🎙️ AI Meeting Assistant")
 
@@ -391,12 +460,16 @@ with col1:
     
     # Status indicator
     if st.session_state.recording:
-        st.info("Recording and transcribing in progress...")
+        status_placeholder = st.empty()
+        status_placeholder.info("Recording and transcribing in progress...")
     
-    # Transcript display
-    transcript_container = st.container(height=400)
-    with transcript_container:
-        st.markdown(st.session_state.transcript)
+    # Create a placeholder for the transcript
+    if 'transcript_placeholder' not in st.session_state:
+        st.session_state.transcript_placeholder = st.empty()
+    
+    # Only initializing or updating the placeholder, not creating new ones on rerun
+    # This provides a more stable visual experience
+    st.session_state.transcript_placeholder.markdown(st.session_state.transcript)
     
     # Question and answer section
     st.header("Ask a Question")
@@ -441,17 +514,56 @@ with st.expander("System Information"):
     st.write(f"Summary frequency: {st.session_state.summary_frequency} seconds")
 
 # Main loop for handling results from threads and updating UI
-# This runs only in the main Streamlit thread
 if st.session_state.recording:
     rerun_needed = False
     # Process new transcript text from the queue
     while not st.session_state.transcript_q.empty():
         try:
-            new_text = st.session_state.transcript_q.get_nowait()
-            st.session_state.transcript += " " + new_text
-            rerun_needed = True
+            # Get new transcription result
+            result = st.session_state.transcript_q.get_nowait()
+            
+            if isinstance(result, dict) and "is_correction" in result and result["is_correction"]:
+                # This is a correction to previous text
+                new_text = result["text"]
+                current_text = st.session_state.transcript
+                
+                # A simple approach: find the best match for the last N words
+                words = current_text.split()
+                if len(words) > 10:
+                    # Find the best matching point to apply correction
+                    common_suffix = find_common_suffix(current_text, new_text, max_words=15)
+                    if common_suffix:
+                        # Replace the last portion of the transcript with the corrected version
+                        correction_point = current_text.rfind(common_suffix)
+                        if correction_point > 0:
+                            st.session_state.transcript = current_text[:correction_point] + new_text
+                            rerun_needed = True
+                    else:
+                        # Fall back to appending if we can't find a good correction point
+                        st.session_state.transcript += " " + new_text
+                        rerun_needed = True
+                else:
+                    # Not enough context for correction, just append
+                    st.session_state.transcript += " " + new_text
+                    rerun_needed = True
+            else:
+                # Simple append for non-correction segments
+                text = result["text"] if isinstance(result, dict) else result
+                st.session_state.transcript += " " + text
+                rerun_needed = True
+                
+            # Format with highlighting if this was a correction
+            formatted_transcript = format_transcript_with_highlight(
+                st.session_state.transcript,
+                last_updated_portion=new_text if isinstance(result, dict) and "is_correction" in result and result["is_correction"] else None
+            )
+            st.session_state.transcript_placeholder.markdown(
+                formatted_transcript, 
+                unsafe_allow_html=True
+            )
+                
         except queue.Empty:
-            break # Should not happen with not empty check, but good practice
+            break
 
     # Check if it's time to generate a summary
     current_time = time.time()
@@ -461,17 +573,6 @@ if st.session_state.recording:
         st.session_state.last_summary_time = current_time
         rerun_needed = True
 
-    # Rerun the app to reflect updates
-    if rerun_needed:
-        # Short sleep might help prevent rapid-fire reruns if queue fills fast
-        time.sleep(0.1)
-        st.rerun()
-    else:
-        # If no updates, sleep a bit before checking again to avoid busy-waiting
-        # This creates a polling loop while recording is active
-        time.sleep(0.5) # Adjust sleep time as needed
-        # Need to trigger a rerun periodically even without new data to keep the loop alive
-        st.rerun()
-
-# Ensure the loop stops checking when recording stops.
-# The st.rerun() call will respect the st.session_state.recording flag on the next run. 
+    # Ensure we rerun the app periodically to keep the UI responsive even when no updates occur
+    time.sleep(0.25)  # Short sleep to prevent excessive CPU usage
+    st.rerun() 
