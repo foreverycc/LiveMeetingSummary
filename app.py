@@ -357,6 +357,56 @@ def find_common_suffix(text1, text2, max_words=10):
             
     return None
 
+def find_new_content(current_text, new_text, overlap_threshold=0.7):
+    """
+    Identify only the truly new content from new_text compared to current_text.
+    Returns tuple: (new content to append, whether it's a correction)
+    """
+    # If current text is empty, everything is new
+    if not current_text:
+        return new_text, False
+        
+    # Split into sentences for better comparison
+    import re
+    current_sentences = re.split(r'(?<=[.!?])\s+', current_text)
+    new_sentences = re.split(r'(?<=[.!?])\s+', new_text)
+    
+    # Check if the new text is completely contained in the current text
+    if new_text in current_text:
+        return "", False
+    
+    # Find the first unique sentence in the new text
+    for i, new_sentence in enumerate(new_sentences):
+        # Skip very short sentences as they might match commonly
+        if len(new_sentence.split()) < 3:
+            continue
+            
+        # Check if this sentence exists in current text
+        if new_sentence in current_text:
+            continue
+            
+        # If we get here, we've found the first unique sentence
+        unique_start_idx = i
+        break
+    else:
+        # If all sentences exist in current text
+        return "", False
+    
+    # Check if this is a correction (significant overlap at start)
+    # or just new content to append
+    
+    # First, check if the beginning of new_text matches the end of current_text
+    common_suffix = find_common_suffix(current_text, new_text, max_words=15)
+    if common_suffix and len(common_suffix) > 10:
+        # This is likely a correction
+        correction_point = current_text.rfind(common_suffix)
+        if correction_point > 0:
+            # Return the entire new text as a correction
+            return new_text, True
+    
+    # Otherwise, return only the new sentences
+    return " ".join(new_sentences[unique_start_idx:]), False
+
 # Add to the top of your app.py file
 st.markdown("""
 <style>
@@ -374,15 +424,26 @@ st.markdown("""
 # Then modify transcript display to use HTML when needed
 def format_transcript_with_highlight(transcript, last_updated_portion=None):
     """Format transcript with visual highlighting for recently corrected text."""
+    if not transcript:
+        return ""
+        
+    # Escape any HTML characters to prevent rendering issues
+    # (This is important to avoid breaking the markdown parser)
+    import html
+    safe_transcript = html.escape(transcript)
+    
     if last_updated_portion and last_updated_portion in transcript:
+        # Escape the portion to highlight too
+        safe_highlight = html.escape(last_updated_portion)
         # Highlight the corrected portion
-        highlighted = transcript.replace(
-            last_updated_portion, 
-            f'<span class="correction">{last_updated_portion}</span>', 
+        highlighted = safe_transcript.replace(
+            safe_highlight, 
+            f'<span class="correction">{safe_highlight}</span>', 
             1
         )
         return highlighted
-    return transcript
+    
+    return safe_transcript
 
 # UI Layout
 st.title("🎙️ AI Meeting Assistant")
@@ -460,16 +521,23 @@ with col1:
     
     # Status indicator
     if st.session_state.recording:
-        status_placeholder = st.empty()
-        status_placeholder.info("Recording and transcribing in progress...")
+        st.info("Recording and transcribing in progress...")
     
-    # Create a placeholder for the transcript
-    if 'transcript_placeholder' not in st.session_state:
-        st.session_state.transcript_placeholder = st.empty()
+    # Use a simple text area with fixed height instead of a dynamic placeholder
+    # This is more stable for long, frequently updating content
+    transcript_container = st.container(height=400)
     
-    # Only initializing or updating the placeholder, not creating new ones on rerun
-    # This provides a more stable visual experience
-    st.session_state.transcript_placeholder.markdown(st.session_state.transcript)
+    with transcript_container:
+        # Render the transcript as HTML within markdown
+        # This avoids the ElementNode issue with st.empty() updates
+        if st.session_state.transcript:
+            formatted = format_transcript_with_highlight(
+                st.session_state.transcript,
+                st.session_state.last_correction
+            )
+            st.markdown(f'<div style="height: 380px; overflow-y: auto;">{formatted}</div>', unsafe_allow_html=True)
+        else:
+            st.write("*Waiting for transcript...*")
     
     # Question and answer section
     st.header("Ask a Question")
@@ -522,45 +590,36 @@ if st.session_state.recording:
             # Get new transcription result
             result = st.session_state.transcript_q.get_nowait()
             
-            if isinstance(result, dict) and "is_correction" in result and result["is_correction"]:
-                # This is a correction to previous text
-                new_text = result["text"]
-                current_text = st.session_state.transcript
-                
-                # A simple approach: find the best match for the last N words
-                words = current_text.split()
-                if len(words) > 10:
-                    # Find the best matching point to apply correction
-                    common_suffix = find_common_suffix(current_text, new_text, max_words=15)
+            # Extract the transcribed text
+            text = result["text"] if isinstance(result, dict) else result
+            
+            # Find what's truly new in this transcription
+            new_content, is_correction = find_new_content(
+                st.session_state.transcript, 
+                text
+            )
+            
+            # Only update if we have meaningful new content
+            if new_content:
+                if is_correction:
+                    # Handle correction case - find where to replace
+                    common_suffix = find_common_suffix(st.session_state.transcript, new_content, max_words=15)
                     if common_suffix:
-                        # Replace the last portion of the transcript with the corrected version
-                        correction_point = current_text.rfind(common_suffix)
+                        correction_point = st.session_state.transcript.rfind(common_suffix)
                         if correction_point > 0:
-                            st.session_state.transcript = current_text[:correction_point] + new_text
+                            st.session_state.transcript = st.session_state.transcript[:correction_point] + new_content
+                            st.session_state.last_correction = new_content
                             rerun_needed = True
                     else:
-                        # Fall back to appending if we can't find a good correction point
-                        st.session_state.transcript += " " + new_text
+                        # Fallback if no good correction point
+                        st.session_state.transcript += " " + new_content
+                        st.session_state.last_correction = None
                         rerun_needed = True
                 else:
-                    # Not enough context for correction, just append
-                    st.session_state.transcript += " " + new_text
+                    # Simple append for new content
+                    st.session_state.transcript += " " + new_content
+                    st.session_state.last_correction = None
                     rerun_needed = True
-            else:
-                # Simple append for non-correction segments
-                text = result["text"] if isinstance(result, dict) else result
-                st.session_state.transcript += " " + text
-                rerun_needed = True
-                
-            # Format with highlighting if this was a correction
-            formatted_transcript = format_transcript_with_highlight(
-                st.session_state.transcript,
-                last_updated_portion=new_text if isinstance(result, dict) and "is_correction" in result and result["is_correction"] else None
-            )
-            st.session_state.transcript_placeholder.markdown(
-                formatted_transcript, 
-                unsafe_allow_html=True
-            )
                 
         except queue.Empty:
             break
@@ -569,10 +628,14 @@ if st.session_state.recording:
     current_time = time.time()
     if (current_time - st.session_state.last_summary_time >= st.session_state.summary_frequency and
         st.session_state.transcript.strip()):
-        generate_summary() # Call from main thread is safe
+        generate_summary()
         st.session_state.last_summary_time = current_time
         rerun_needed = True
 
-    # Ensure we rerun the app periodically to keep the UI responsive even when no updates occur
-    time.sleep(0.25)  # Short sleep to prevent excessive CPU usage
-    st.rerun() 
+    # Only rerun if needed, and not too frequently
+    if rerun_needed:
+        time.sleep(0.25)  # Short sleep to prevent excessive CPU usage
+        st.rerun()
+    else:
+        time.sleep(0.5)  # Longer sleep if no updates
+        st.rerun() 
