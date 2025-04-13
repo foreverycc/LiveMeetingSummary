@@ -12,6 +12,7 @@ import os
 from datetime import datetime
 import torch
 from typing import Optional, Dict, List, Any
+import difflib  # Add this to your imports
 
 # Configure page settings
 st.set_page_config(
@@ -42,6 +43,12 @@ if 'needs_update' not in st.session_state:
     st.session_state.needs_update = False
 if 'last_correction' not in st.session_state:
     st.session_state.last_correction = None
+if 'current_summary' not in st.session_state:
+    st.session_state.current_summary = ""
+if 'last_summary_update' not in st.session_state:
+    st.session_state.last_summary_update = None
+if 'highlighted_summary' not in st.session_state:
+    st.session_state.highlighted_summary = ""
 
 # LLM provider configuration
 @st.cache_resource
@@ -160,38 +167,59 @@ def process_audio(stop_event, audio_q, transcript_q, whisper_model_instance):
                 break
 
 def generate_summary():
-    """Generate a summary of the current transcript using the selected LLM."""
+    """Generate a completely fresh summary of the current transcript and highlight changes."""
     if not st.session_state.transcript.strip():
         return
     
     try:
-        summary = ""
-        prompt = f"""Please provide a concise summary of the following meeting transcript:
+        # Store the previous summary before generating a new one
+        previous_summary = st.session_state.current_summary
         
+        # Create a prompt that encourages a fresh summary each time
+        prompt = f"""Create a concise summary of the following meeting transcript in Markdown format.
+        
+Transcript:
 {st.session_state.transcript}
+
+Previous Summary:
+{previous_summary}
+
+Guidelines:
+1. Create a fresh summary based on the transcript and the previous summaries, make minimal changes to the previous summary.
+2. Focus only on the key information and main points.
+3. Use the following Markdown formatting:
+   - ## Meeting Overview (as the main heading)
+   - Bullet points for key discussion items
+   - **Bold text** for important decisions or action items
+   - Brief section at the end for "Next Steps" if applicable
+
+Keep the summary focused and concise. Remove any redundant information.
 
 Summary:"""
 
         # Use selected LLM to generate summary
         if st.session_state.llm_provider == "Gemini":
             model = genai.GenerativeModel(st.session_state.llm_model)
-            response = model.generate_content(prompt)
-            summary = response.text
+            response = model.generate_content(prompt, generation_config={"temperature": 0.1})
+            new_summary = response.text
         elif st.session_state.llm_provider == "OpenAI":
             response = openai.ChatCompletion.create(
                 model=st.session_state.llm_model,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=500
             )
-            summary = response.choices[0].message.content
+            new_summary = response.choices[0].message.content
         
-        # Store the summary with timestamp
-        if summary:
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            st.session_state.summaries.append({
-                "timestamp": timestamp,
-                "summary": summary
-            })
+        # Store the raw new summary
+        st.session_state.current_summary = new_summary
+        
+        # Compare with previous summary and store highlighted version
+        st.session_state.highlighted_summary = detect_summary_changes(previous_summary, new_summary)
+        
+        # Store timestamp of when the summary was last updated
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        st.session_state.last_summary_timestamp = timestamp
+        
     except Exception as e:
         st.error(f"Error generating summary: {str(e)}")
 
@@ -242,7 +270,7 @@ def export_session_data():
     session_data = {
         "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "transcript": st.session_state.transcript,
-        "summaries": st.session_state.summaries,
+        "summary": st.session_state.current_summary,
         "questions_answers": st.session_state.questions_answers
     }
     
@@ -256,7 +284,8 @@ def start_recording():
     # Clear previous session data if requested
     if st.session_state.clear_previous:
         st.session_state.transcript = ""
-        st.session_state.summaries = []
+        st.session_state.current_summary = ""  # Clear current summary
+        st.session_state.last_summary_update = None
         st.session_state.questions_answers = []
         # Ensure queue is cleared as well if resetting
         while not st.session_state.audio_queue.empty():
@@ -445,6 +474,59 @@ def format_transcript_with_highlight(transcript, last_updated_portion=None):
     
     return safe_transcript
 
+def format_summary_with_highlight(summary, previous_summary=None):
+    """Format summary with visual highlighting for updated content."""
+    if not summary:
+        return ""
+    
+    # Escape any HTML characters to prevent rendering issues
+    import html
+    safe_summary = html.escape(summary)
+    
+    # No highlighting needed if there's no previous summary
+    if not previous_summary:
+        return safe_summary
+    
+    # For simplicity, we'll highlight the entire summary when it's updated
+    # A more sophisticated approach could try to identify specific changed sections
+    return f'<div class="correction">{safe_summary}</div>'
+
+# Add to the start of the file or where appropriate
+def detect_summary_changes(old_summary, new_summary):
+    """
+    Compare old and new summaries to identify and highlight the changed portions.
+    Returns the new summary with HTML highlighting for changed parts.
+    """
+    if not old_summary:
+        return new_summary  # No highlighting needed for the first summary
+    
+    # Split summaries into lines for better comparison
+    old_lines = old_summary.splitlines()
+    new_lines = new_summary.splitlines()
+    
+    # Use difflib to compare the two summaries line by line
+    differ = difflib.Differ()
+    diff = list(differ.compare(old_lines, new_lines))
+    
+    # Process the diff results to identify added/changed lines
+    highlighted_lines = []
+    for line in diff:
+        if line.startswith('+ '):  # Added line
+            # Extract the content without the diff marker
+            content = line[2:]
+            highlighted_lines.append(f'<span class="correction">{content}</span>')
+        elif line.startswith('- '):  # Removed line - we skip these
+            continue
+        elif line.startswith('  '):  # Unchanged line
+            # Extract the content without the diff marker
+            content = line[2:]
+            highlighted_lines.append(content)
+        elif line.startswith('? '):  # Diff information line - we skip these
+            continue
+    
+    # Join the highlighted lines back together
+    return '<br>'.join(highlighted_lines)
+
 # UI Layout
 st.title("🎙️ AI Meeting Assistant")
 
@@ -550,14 +632,32 @@ with col1:
         st.write("Answer:")
         st.info(answer)
 
-# Right column - Summaries
+# Right column - Summary in Markdown format
 with col2:
-    st.header("Meeting Summaries")
-    summaries_container = st.container(height=400)
-    with summaries_container:
-        for summary in reversed(st.session_state.summaries):
-            with st.expander(f"Summary at {summary['timestamp']}", expanded=True):
-                st.write(summary["summary"])
+    st.header("Meeting Summary")
+    summary_container = st.container(height=400)
+    
+    with summary_container:
+        if st.session_state.current_summary:
+            # Display timestamp of last update
+            last_update = getattr(st.session_state, 'last_summary_timestamp', 'N/A')
+            st.caption(f"Last updated at {last_update}")
+            
+            # Check if we have a highlighted summary
+            if hasattr(st.session_state, 'highlighted_summary') and st.session_state.highlighted_summary:
+                # Display the highlighted summary
+                st.markdown(
+                    f'<div style="height: 380px; overflow-y: auto;">{st.session_state.highlighted_summary}</div>', 
+                    unsafe_allow_html=True
+                )
+            else:
+                # Display the regular summary if no highlights are available
+                st.markdown(
+                    f'<div style="height: 380px; overflow-y: auto;">{st.session_state.current_summary}</div>', 
+                    unsafe_allow_html=True
+                )
+        else:
+            st.write("*No summary generated yet. Start recording to generate a summary.*")
     
     # Previous Q&A display
     if st.session_state.questions_answers:
