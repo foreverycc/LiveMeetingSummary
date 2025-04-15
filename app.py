@@ -49,6 +49,15 @@ if 'last_summary_update' not in st.session_state:
     st.session_state.last_summary_update = None
 if 'highlighted_summary' not in st.session_state:
     st.session_state.highlighted_summary = ""
+# Add a new session state variable for the high-level summary
+if 'high_level_summary' not in st.session_state:
+    st.session_state.high_level_summary = ""
+if 'highlighted_high_level_summary' not in st.session_state:
+    st.session_state.highlighted_high_level_summary = ""
+if 'last_high_level_summary_time' not in st.session_state:
+    st.session_state.last_high_level_summary_time = time.time()
+if 'high_level_summary_timestamp' not in st.session_state:
+    st.session_state.high_level_summary_timestamp = None
 
 # LLM provider configuration
 @st.cache_resource
@@ -270,7 +279,8 @@ def export_session_data():
     session_data = {
         "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "transcript": st.session_state.transcript,
-        "summary": st.session_state.current_summary,
+        "high_level_summary": st.session_state.high_level_summary,
+        "detailed_summary": st.session_state.current_summary,
         "questions_answers": st.session_state.questions_answers
     }
     
@@ -346,17 +356,9 @@ def stop_recording():
         st.warning(f"Error joining threads: {e}") # Log potential issues joining
 
     # Process any remaining audio in the queue after stopping recording
-    # Use the queue directly from session state here as we are in the main thread context
-    try:
-        # Pass the queue from session state to process any final chunks
-        # Need a way to call process_audio for final processing safely.
-        # Simpler: Generate final summary based on current transcript.
-        pass # Let the proc_thread finish processing via the join() call above.
-    except Exception as e:
-         st.warning(f"Error processing remaining audio: {e}")
-
-    # Generate a final summary
+    # Generate final summaries
     generate_summary()
+    generate_high_level_summary()
 
     st.session_state.recording = False
     # Clean up references (optional but good practice)
@@ -527,6 +529,54 @@ def detect_summary_changes(old_summary, new_summary):
     # Join the highlighted lines back together
     return '<br>'.join(highlighted_lines)
 
+def generate_high_level_summary():
+    """Generate a concise, high-level summary of the meeting."""
+    if not st.session_state.transcript.strip():
+        return
+    
+    try:
+        # Store the previous summary
+        previous_summary = st.session_state.high_level_summary
+        
+        # Create a prompt specifically for a high-level, concise summary
+
+        prompt = f"""Create a very concise high-level summary of this meeting, List key points with bullet points.
+Transcript:
+{st.session_state.transcript}
+
+The summary should be BRIEF (2-4 sentences maximum) and focus only on the most important information.
+Use crisp, executive-style language. Format with:
+- <h3>Main Topic</h3> for the meeting topic (one line)
+- <p>Brief description of 1-3 key points or decisions.</p>
+
+Keep it extremely focused - this is an executive summary, not a detailed account."""
+
+        # Generate the high-level summary
+        if st.session_state.llm_provider == "Gemini":
+            model = genai.GenerativeModel(st.session_state.llm_model)
+            response = model.generate_content(prompt, generation_config={"temperature": 0.1})
+            new_summary = response.text
+        elif st.session_state.llm_provider == "OpenAI":
+            response = openai.ChatCompletion.create(
+                model=st.session_state.llm_model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=150  # Shorter than regular summary
+            )
+            new_summary = response.choices[0].message.content
+        
+        # Store the new high-level summary
+        st.session_state.high_level_summary = new_summary
+        
+        # Compare with previous summary and store highlighted version
+        st.session_state.highlighted_high_level_summary = detect_summary_changes(previous_summary, new_summary)
+        
+        # Store timestamp
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        st.session_state.high_level_summary_timestamp = timestamp
+        
+    except Exception as e:
+        st.error(f"Error generating high-level summary: {str(e)}")
+
 # UI Layout
 st.title("🎙️ AI Meeting Assistant")
 
@@ -594,38 +644,57 @@ with st.sidebar:
             mime="application/json"
         )
 
-# Main content area - Split into columns
+# Main content area - Split into columns 
 col1, col2 = st.columns([3, 2])
 
-# Left column - Transcript
+# Left column - Meeting Summary and Transcript
 with col2:
+    # Meeting Summary (new high-level panel)
+    st.header("Meeting Summary")
+    meeting_summary_container = st.container(height=400)  # Smaller height for concise summary
+    
+    with meeting_summary_container:
+        if st.session_state.high_level_summary:
+            # Display timestamp of last update
+            last_update = getattr(st.session_state, 'high_level_summary_timestamp', 'N/A')
+            st.caption(f"Last updated at {last_update}")
+            
+            # Display the high-level summary with highlighting if available
+            if hasattr(st.session_state, 'highlighted_high_level_summary') and st.session_state.highlighted_high_level_summary:
+                st.markdown(
+                    f'<div style="height: 380px; overflow-y: auto;">{st.session_state.highlighted_high_level_summary}</div>', 
+                    unsafe_allow_html=True
+                )
+            else:
+                st.markdown(
+                    f'<div style="height: 380px; overflow-y: auto;">{st.session_state.high_level_summary}</div>', 
+                    unsafe_allow_html=True
+                )
+        else:
+            st.write("*High-level summary will appear here. Start recording to generate.*")
+    
+    # Live Transcript (moved down)
     st.header("Live Transcript")
     
     # Status indicator
     if st.session_state.recording:
         st.info("Recording and transcribing in progress...")
     
-    # Use a simple text area with fixed height instead of a dynamic placeholder
-    # This is more stable for long, frequently updating content
-    transcript_container = st.container(height=400)
+    transcript_container = st.container(height=200)  # Slightly reduced height
     
     with transcript_container:
-        # Render the transcript as HTML within markdown
-        # This avoids the ElementNode issue with st.empty() updates
         if st.session_state.transcript:
             formatted = format_transcript_with_highlight(
                 st.session_state.transcript,
                 st.session_state.last_correction
             )
-            st.markdown(f'<div style="height: 380px; overflow-y: auto;">{formatted}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div style="height: 180px; overflow-y: auto;">{formatted}</div>', unsafe_allow_html=True)
         else:
             st.write("*Waiting for transcript...*")
-    
-    
 
-# Right column - Summary in Markdown format
+# Right column - Live Summary and Q&A
 with col1:
-    st.header("Meeting Summary")
+    st.header("Live Summary")
     summary_container = st.container(height=400)
     
     with summary_container:
@@ -636,13 +705,11 @@ with col1:
             
             # Check if we have a highlighted summary
             if hasattr(st.session_state, 'highlighted_summary') and st.session_state.highlighted_summary:
-                # Display the highlighted summary
                 st.markdown(
                     f'<div style="height: 380px; overflow-y: auto;">{st.session_state.highlighted_summary}</div>', 
                     unsafe_allow_html=True
                 )
             else:
-                # Display the regular summary if no highlights are available
                 st.markdown(
                     f'<div style="height: 380px; overflow-y: auto;">{st.session_state.current_summary}</div>', 
                     unsafe_allow_html=True
@@ -664,7 +731,7 @@ with col1:
     # Previous Q&A display
     if st.session_state.questions_answers:
         st.header("Previous Questions & Answers")
-        qa_container = st.container(height=300)
+        qa_container = st.container(height=200)
         with qa_container:
             for qa in reversed(st.session_state.questions_answers):
                 with st.expander(f"Q&A at {qa['timestamp']}", expanded=False):
@@ -732,6 +799,14 @@ if st.session_state.recording:
         st.session_state.transcript.strip()):
         generate_summary()
         st.session_state.last_summary_time = current_time
+        rerun_needed = True
+        
+    # Check if it's time to generate a high-level summary (less frequently)
+    high_level_frequency = st.session_state.summary_frequency * 2  # Generate half as often as detailed summary
+    if (current_time - st.session_state.last_high_level_summary_time >= high_level_frequency and
+        st.session_state.transcript.strip()):
+        generate_high_level_summary()
+        st.session_state.last_high_level_summary_time = current_time
         rerun_needed = True
 
     # Only rerun if needed, and not too frequently
