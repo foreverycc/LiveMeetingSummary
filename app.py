@@ -56,12 +56,12 @@ def load_api_keys():
     """Load API keys from environment variables or Streamlit secrets."""
     keys = {
         "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY"),
-        "GOOGLE_API_KEY": os.getenv("GOOGLE_API_KEY")
+        "GENAI_API_KEY": os.getenv("GENAI_API_KEY")
     }
     
     # Initialize API clients
-    if keys["GOOGLE_API_KEY"]:
-        genai.configure(api_key=keys["GOOGLE_API_KEY"])
+    if keys["GENAI_API_KEY"]:
+        genai.configure(api_key=keys["GENAI_API_KEY"])
     if keys["OPENAI_API_KEY"]:
         openai.api_key = keys["OPENAI_API_KEY"]
         
@@ -598,7 +598,7 @@ with st.sidebar:
 col1, col2 = st.columns([3, 2])
 
 # Left column - Transcript
-with col1:
+with col2:
     st.header("Live Transcript")
     
     # Status indicator
@@ -621,19 +621,10 @@ with col1:
         else:
             st.write("*Waiting for transcript...*")
     
-    # Question and answer section
-    st.header("Ask a Question")
-    with st.form("question_form", clear_on_submit=True):
-        question = st.text_input("Enter your question about the meeting content")
-        submit_question = st.form_submit_button("Submit Question")
-        
-    if submit_question and question:
-        answer = answer_question(question)
-        st.write("Answer:")
-        st.info(answer)
+    
 
 # Right column - Summary in Markdown format
-with col2:
+with col1:
     st.header("Meeting Summary")
     summary_container = st.container(height=400)
     
@@ -659,6 +650,17 @@ with col2:
         else:
             st.write("*No summary generated yet. Start recording to generate a summary.*")
     
+    # Question and answer section
+    st.header("Ask a Question")
+    with st.form("question_form", clear_on_submit=True):
+        question = st.text_input("Enter your question about the meeting content")
+        submit_question = st.form_submit_button("Submit Question")
+        
+    if submit_question and question:
+        answer = answer_question(question)
+        st.write("Answer:")
+        st.info(answer)
+        
     # Previous Q&A display
     if st.session_state.questions_answers:
         st.header("Previous Questions & Answers")
