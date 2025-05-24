@@ -589,7 +589,7 @@ with st.sidebar:
     st.session_state.whisper_selection = st.selectbox(
         "Select Whisper Model", 
         whisper_models,
-        index=1
+        index=3
     )
     
     # LLM provider and model selection
@@ -617,7 +617,7 @@ with st.sidebar:
         "Summary Update Frequency (seconds)",
         min_value=5,
         max_value=30,
-        value=10,
+        value=20,
         step=1
     )
     
